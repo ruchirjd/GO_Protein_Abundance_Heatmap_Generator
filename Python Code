@@ -1,0 +1,456 @@
+import pandas as pd
+import numpy as np
+from typing import List, Dict
+import os
+import seaborn as sns
+import matplotlib
+matplotlib.use('Agg')  # Set backend to Agg before importing pyplot
+import matplotlib.pyplot as plt
+
+def load_csv_file(file_path: str) -> pd.DataFrame:
+    """Load CSV file and return DataFrame"""
+    try:
+        return pd.read_csv(file_path)
+    except Exception as e:
+        print(f"Error loading file {file_path}: {str(e)}")
+        return None
+
+def extract_go_ids(df: pd.DataFrame, go_ids: List[str]) -> pd.DataFrame:
+    """Extract rows containing specified GO IDs"""
+    # Find columns that might contain GO terms using flexible patterns
+    potential_go_patterns = ['GO', 'go', 'Go', 'gene ontology', 'Gene Ontology', 'GO_', 'go_']
+    go_columns = []
+    
+    for col in df.columns:
+        # Check if any of the patterns exist in the column name
+        if any(pattern in str(col) for pattern in potential_go_patterns):
+            go_columns.append(col)
+        else:
+            # Check if the column contains any GO-like values (e.g., "GO:0005524")
+            if isinstance(df[col].iloc[0], str) and any('GO:' in str(val) for val in df[col].dropna().head()):
+                go_columns.append(col)
+    
+    if go_columns:
+        print(f"Found GO-related columns: {go_columns}")
+    else:
+        print("No explicit GO columns found. Will search all text columns for GO terms.")
+        # Look for GO terms in all string/object columns
+        go_columns = df.select_dtypes(include=['object']).columns.tolist()
+    
+    # Create mask for each GO column and combine them
+    mask = pd.Series([False] * len(df))
+    
+    # Store matching GO terms for each protein
+    matching_go_terms = pd.Series([''] * len(df))
+    
+    for col in go_columns:
+        try:
+            # Convert column to string type to handle NaN values
+            df.loc[:, col] = df[col].astype(str)
+            
+            # Split the comma-separated GO IDs and check each one
+            for go_id in go_ids:
+                # Make the search more flexible by removing spaces and handling different formats
+                clean_go_id = go_id.strip().replace(" ", "")
+                
+                # Check for exact match and partial match (in case GO: prefix is missing)
+                matches = df[col].str.split('[,;]').apply(
+                    lambda x: any(
+                        clean_go_id in item.strip().replace(" ", "") or 
+                        (clean_go_id.replace("GO:", "") in item.strip().replace(" ", ""))
+                        for item in x if pd.notna(item)
+                    )
+                )
+                
+                mask = mask | matches
+                
+                # Store matching GO terms
+                matching_indices = matches[matches].index
+                matching_go_terms[matching_indices] = matching_go_terms[matching_indices] + go_id + '; '
+        except Exception as e:
+            print(f"Warning: Could not process column {col}: {str(e)}")
+            continue
+    
+    # Add matching GO terms as a new column
+    result_df = df[mask].copy()
+    result_df['Matching_GO_Terms'] = matching_go_terms[mask].str.rstrip('; ')
+    
+    # Print debug info
+    print(f"\nFound {len(result_df)} rows matching GO IDs")
+    
+    # Check for average columns
+    avg_cols = [col for col in result_df.columns if 'average' in col.lower()]
+    print(f"Average columns found: {avg_cols}")
+    if avg_cols:
+        print("\nSample of average columns before processing:")
+        print(result_df[avg_cols].head())
+    
+    return result_df
+
+def calculate_average_specs(df: pd.DataFrame) -> pd.Series:
+    """Calculate average of all Average columns for each row"""
+    avg_cols = [col for col in df.columns if 'average' in col.lower()]
+    if not avg_cols:
+        return pd.Series([])
+    # Convert to numeric and calculate mean
+    avg_values = df[avg_cols].apply(pd.to_numeric, errors='coerce').fillna(0).mean(axis=1)
+    return avg_values
+
+def process_spec_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Process average columns by handling missing/zero values"""
+    # Get average columns
+    avg_cols = [col for col in df.columns if 'average' in col.lower()]
+    if not avg_cols:
+        print("No average columns found to process")
+        return df
+    
+    print(f"\nProcessing {len(avg_cols)} average columns: {avg_cols}")
+    print("\nBefore processing (first 5 rows):")
+    print(df[avg_cols].head())
+    
+    # Create a copy to avoid modifying the original
+    processed_df = df.copy()
+    
+    # Convert average columns to numeric
+    for col in avg_cols:
+        try:
+            # First, handle any commas in numbers
+            processed_df[col] = processed_df[col].astype(str).str.replace(',', '')
+            # Convert to numeric
+            processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce')
+            print(f"\nConverted {col} to numeric. Sample values:")
+            print(processed_df[col].head())
+        except Exception as e:
+            print(f"Error processing column {col}: {str(e)}")
+    
+    # Find minimum non-zero value across all average columns
+    min_non_zero = processed_df[avg_cols].replace(0, np.nan).min().min()
+    print(f"\nMinimum non-zero value found: {min_non_zero}")
+    
+    # Replace zeros and NaN with minimum value
+    for col in avg_cols:
+        processed_df.loc[:, col] = processed_df[col].replace({0: min_non_zero, np.nan: min_non_zero})
+    
+    return processed_df
+
+def join_dataframes(df1: pd.DataFrame, df2: pd.DataFrame, protein_col: str = None) -> tuple:
+    """Join two dataframes based on protein column"""
+    # Find the protein column if not provided
+    if protein_col is None:
+        protein_col = find_protein_column(df1)
+        protein_col_2 = find_protein_column(df2)
+    else:
+        protein_col_2 = protein_col
+    
+    print(f"Joining dataframes using protein columns: {protein_col} and {protein_col_2}")
+    
+    # Get average columns
+    avg_cols_1 = [col for col in df1.columns if 'average' in col.lower()]
+    avg_cols_2 = [col for col in df2.columns if 'average' in col.lower()]
+    
+    print("\nAverage columns found:")
+    print("First file:", avg_cols_1)
+    print("Second file:", avg_cols_2)
+    
+    # Create temporary dataframes for merging
+    df1_temp = pd.DataFrame({
+        'Adult': df1[avg_cols_1[0]] * 10000,  # Scale here
+        'Adult_GO': df1['Matching_GO_Terms'],
+        'ProteinName': df1[protein_col]
+    })
+    
+    df2_temp = pd.DataFrame({
+        'Larva': df2[avg_cols_2[0]] * 10000,  # Scale here
+        'Larva_GO': df2['Matching_GO_Terms'],
+        'ProteinName': df2[protein_col_2]
+    })
+    
+    print("\nSample values after scaling:")
+    print("Adult values:")
+    print(df1_temp[['ProteinName', 'Adult']].head())
+    print("\nLarva values:")
+    print(df2_temp[['ProteinName', 'Larva']].head())
+    
+    # Merge dataframes on protein name
+    merged_df = pd.merge(df1_temp, df2_temp, on='ProteinName', how='outer')
+    
+    # Combine GO terms and remove duplicates
+    merged_df['GO_Terms'] = merged_df.apply(
+        lambda row: '; '.join(sorted(set(
+            [term.strip() for terms in [
+                str(row['Adult_GO']).split(';') if pd.notna(row['Adult_GO']) else [],
+                str(row['Larva_GO']).split(';') if pd.notna(row['Larva_GO']) else []
+            ] for term in terms if term.strip()]
+        ))), axis=1
+    )
+    
+    # Drop intermediate GO columns
+    merged_df = merged_df.drop(['Adult_GO', 'Larva_GO'], axis=1)
+    
+    # Fill NaN with 0
+    merged_df['Adult'] = merged_df['Adult'].fillna(0)
+    merged_df['Larva'] = merged_df['Larva'].fillna(0)
+    
+    print("\nFinal merged dataframe (first 5 rows):")
+    print(merged_df.head())
+    print("\nValue ranges:")
+    print("Adult range:", merged_df['Adult'].min(), "to", merged_df['Adult'].max())
+    print("Larva range:", merged_df['Larva'].min(), "to", merged_df['Larva'].max())
+    
+    return merged_df
+
+def compare_go_results(df1: pd.DataFrame, df2: pd.DataFrame, output_file: str):
+    """Compare results between two files and save analysis"""
+    # Calculate average specs
+    df1_avg = calculate_average_specs(df1)
+    df2_avg = calculate_average_specs(df2)
+    
+    comparison_results = {
+        'File1_rows': len(df1),
+        'File2_rows': len(df2),
+        'Common_rows': len(set(df1.index) & set(df2.index))
+    }
+    
+    stats = {
+        'Mean_File1': df1_avg.mean(),
+        'Mean_File2': df2_avg.mean(),
+        'Std_File1': df1_avg.std(),
+        'Std_File2': df2_avg.std(),
+        'Log2_Fold_Change': np.log2(df1_avg.mean() / df2_avg.mean())
+    }
+    
+    # Save comparison results
+    with open(output_file, 'w') as f:
+        f.write("Comparison Results:\n")
+        for key, value in comparison_results.items():
+            f.write(f"{key}: {value}\n")
+        f.write("\nStatistical Analysis:\n")
+        for key, value in stats.items():
+            f.write(f"{key}: {value}\n")
+    
+    return pd.DataFrame([stats])
+
+def determine_decimal_places(data: pd.DataFrame) -> int:
+    """Determine the number of decimal places needed based on the data"""
+    # Convert all values to strings and find the maximum number of decimal places
+    decimal_counts = data.astype(str).apply(lambda x: x.str.split('.').str[1].str.len() if '.' in x else 0)
+    max_decimals = decimal_counts.max().max()
+    return min(max_decimals, 6)  # Cap at 6 decimal places
+
+def find_protein_column(df: pd.DataFrame) -> str:
+    """Find the protein name column in the dataframe"""
+    # Look for columns containing 'protein' in case-insensitive way
+    protein_cols = [col for col in df.columns if 'protein' in col.lower()]
+    if not protein_cols:
+        raise ValueError("Could not find any column containing 'protein' in the file")
+    # Prefer columns that also contain 'name' if available
+    name_cols = [col for col in protein_cols if 'name' in col.lower()]
+    if name_cols:
+        return name_cols[0]
+    return protein_cols[0]
+
+def generate_heatmap(df1: pd.DataFrame, df2: pd.DataFrame = None, protein_col: str = None, title: str = None):
+    """Generate heatmap for normalized average values. Works with one or two dataframes.
+    Args:
+        df1: First dataframe
+        df2: Optional second dataframe
+        protein_col: Column name containing protein names
+        title: Optional custom title for the heatmap
+    """
+    if df2 is not None:
+        # Use join_dataframes to get the merged data
+        merged_df = join_dataframes(df1, df2, protein_col)
+        
+        # First create the numeric data
+        numeric_data = pd.DataFrame({
+            'Adult': merged_df['Adult'],
+            'Larva': merged_df['Larva']
+        })
+        
+        # Create row labels with protein names and GO terms
+        row_labels = merged_df.apply(lambda row: f"{row['ProteinName']} ({row['GO_Terms']})", axis=1)
+        numeric_data.index = row_labels
+        
+        print("\nMerged data before creating heatmap:")
+        print(merged_df[['ProteinName', 'Adult', 'Larva', 'GO_Terms']].head())
+        print("\nNumeric data shape:", numeric_data.shape)
+        print("Sample of numeric data:")
+        print(numeric_data.head())
+        print("\nValue ranges in numeric data:")
+        print("Adult range:", numeric_data['Adult'].min(), "to", numeric_data['Adult'].max())
+        print("Larva range:", numeric_data['Larva'].min(), "to", numeric_data['Larva'].max())
+        
+        # Values are already scaled by 10,000 in join_dataframes
+        is_scaled = True
+    else:
+        # Single file mode
+        avg_cols = [col for col in df1.columns if 'average' in col.lower()]
+        if not avg_cols:
+            raise ValueError("No Average columns found in the file")
+        
+        # Create row labels with protein names and GO terms
+        row_labels = df1.apply(lambda row: f"{row[protein_col]} ({row['Matching_GO_Terms']})", axis=1)
+        
+        # Create numeric data DataFrame
+        numeric_data = pd.DataFrame(index=row_labels)
+        for col in avg_cols:
+            new_col = 'Adult' if 'hba' in col.lower() else 'Larva' if 'hbl' in col.lower() else col
+            # Scale the values by 10,000
+            numeric_data[new_col] = pd.to_numeric(df1[col], errors='coerce').fillna(0) * 10000
+        is_scaled = True
+    
+    # Calculate figure dimensions
+    num_proteins = len(numeric_data)
+    width = 8.7
+    height = max(8.7, 0.5 * num_proteins)
+    
+    # Create figure
+    plt.figure(figsize=(width, height), dpi=300)
+    
+    # Create annotations
+    def fmt(val):
+        if val == 0:
+            return '0'
+        return '{:.2f}'.format(val)
+    
+    annotations = [[fmt(val) for val in row] for row in numeric_data.values]
+    
+    # Calculate vmin and vmax for better color scaling
+    valid_data = numeric_data.values.flatten()
+    valid_data = valid_data[valid_data > 0]
+    if len(valid_data) > 0:
+        vmin = min(valid_data)
+        vmax = max(valid_data)
+        print(f"\nUsing value range for colors: {vmin:.2f} to {vmax:.2f}")
+    else:
+        vmin = 0
+        vmax = 1
+        print("\nNo valid data found for color scaling, using default range: 0 to 1")
+    
+    # Create heatmap with reduced padding
+    ax = sns.heatmap(numeric_data,
+                    cmap='YlOrRd',
+                    vmin=vmin,
+                    vmax=vmax,
+                    center=(vmin + vmax) / 2,
+                    annot=annotations,
+                    fmt='',
+                    linewidths=0.5,
+                    linecolor='black',
+                    cbar_kws={'label': 'Normalized Average Value (×10⁴)',
+                             'orientation': 'horizontal',
+                             'pad': 0.09,  # Reduced padding
+                             'aspect': 40},  # Made colorbar wider
+                    square=False,
+                    yticklabels=True,
+                    xticklabels=True)
+    
+    # Set title based on user input or default
+    if title:
+        plt.title(title, pad=10, fontsize=14, fontweight='bold')
+    else:
+        plt.title('Protein Abundance', pad=10, fontsize=14, fontweight='bold')
+    
+    plt.xlabel('Sample Type', fontsize=12, fontweight='bold', labelpad=2)  # Reduced labelpad
+    plt.ylabel('Protein', fontsize=12, fontweight='bold', labelpad=5)
+    
+    plt.xticks(rotation=45, ha='right', fontsize=11, fontweight='bold')
+    ax.set_yticklabels(ax.get_yticklabels(), fontsize=9)
+    plt.subplots_adjust(left=0.3, bottom=0.12)  # Reduced bottom margin further
+    
+    ax.set_yticks(np.arange(numeric_data.shape[0] + 1) - 0.5, minor=True)
+    ax.grid(which="minor", color="black", linestyle="-", linewidth=0.5, alpha=0.3)
+    
+    # Adjust colorbar position and size - moved further left and up with reduced height
+    ax.collections[0].colorbar.ax.set_position([0.05, 0.15, 0.8, 0.02])  # [left, bottom, width, height]
+    ax.collections[0].colorbar.ax.tick_params(labelsize=8, pad=2)  # Reduced tick padding
+    
+    # Ensure colorbar label is fully visible with reduced padding
+    ax.collections[0].colorbar.set_label('Normalized Average Value (×10⁴)', fontsize=9.5, labelpad=8)
+    
+    plt.tight_layout()
+    
+    plt.savefig('normalized_average_value_heatmap.png', dpi=600, bbox_inches='tight', facecolor='white')
+    plt.savefig('normalized_average_value_heatmap.pdf', bbox_inches='tight', facecolor='white')
+    plt.close()
+    
+    # Save data to CSV with original values
+    numeric_data.to_csv('merged_results.csv')
+    print("\nResults saved to 'merged_results.csv'")
+    print("Heatmap saved as 'normalized_average_value_heatmap.png' and 'normalized_average_value_heatmap.pdf'")
+
+def main():
+    # Get input files from user
+    print("Enter the paths of input CSV files (press Enter twice to finish):")
+    input_files = []
+    while True:
+        file_path = input().strip()
+        if not file_path:
+            break
+        if os.path.exists(file_path):
+            input_files.append(file_path)
+        else:
+            print(f"File not found: {file_path}")
+    
+    if not input_files:
+        print("No valid input files provided")
+        return
+    
+    # Get GO IDs from user
+    print("Enter GO IDs (one per line, press Enter twice to finish):")
+    go_ids = []
+    while True:
+        go_id = input().strip()
+        if not go_id:
+            break
+        go_ids.append(go_id)
+    
+    if not go_ids:
+        print("No GO IDs provided")
+        return
+    
+    # Get custom title from user
+    print("Enter custom title for the heatmap (press Enter to use default):")
+    custom_title = input().strip()
+    
+    # Process each file
+    results = {}
+    for file_path in input_files:
+        df = load_csv_file(file_path)
+        if df is not None:
+            # Find protein column
+            try:
+                protein_col = find_protein_column(df)
+                print(f"Found protein column in {file_path}: {protein_col}")
+            except ValueError as e:
+                print(f"Error processing {file_path}: {str(e)}")
+                continue
+                
+            result_df = extract_go_ids(df, go_ids)
+            if result_df is not None:
+                # Process average columns
+                result_df = process_spec_columns(result_df)
+                output_file = f"extracted_{os.path.basename(file_path)}"
+                result_df.to_csv(output_file, index=False)
+                print(f"Results saved to {output_file}")
+                results[file_path] = result_df
+    
+    # Generate visualization based on number of files
+    if len(results) == 2:
+        # Two files mode
+        file_paths = list(results.keys())
+        comparison_output = "go_comparison_results.txt"
+        stats_df = compare_go_results(results[file_paths[0]], results[file_paths[1]], comparison_output)
+        print(f"Comparison results saved to {comparison_output}")
+        
+        results[file_paths[0]] = process_spec_columns(results[file_paths[0]])
+        results[file_paths[1]] = process_spec_columns(results[file_paths[1]])
+        
+        generate_heatmap(results[file_paths[0]], results[file_paths[1]], title=custom_title if custom_title else None)
+    elif len(results) == 1:
+        # Single file mode
+        file_path = list(results.keys())[0]
+        generate_heatmap(results[file_path], title=custom_title if custom_title else None)
+
+if __name__ == "__main__":
+    main() 
